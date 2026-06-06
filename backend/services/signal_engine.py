@@ -7,7 +7,7 @@ from decimal import Decimal
 from datetime import datetime, timezone
 from typing import Optional
 import pandas as pd
-import pandas_ta_classic as ta
+import pandas_ta as ta
 from loguru import logger
 
 from backend.db.database import AsyncSessionLocal
