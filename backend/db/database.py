@@ -1,42 +1,53 @@
-"""DB engine — SQLite for local, Postgres for prod."""
+"""
+DB engine — synchronous SQLite via SQLAlchemy.
+Using sync engine avoids the anyio thread-limiter bug on Python 3.14
+(TypeError: cannot create weak reference to NoneType in anyio._backends._asyncio).
+Streamlit is sync anyway — no real benefit to async DB calls here.
+"""
 import os
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy import text
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker, Session
+from contextlib import contextmanager
 from loguru import logger
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./data/autocrypto.db")
-is_sqlite = DATABASE_URL.startswith("sqlite")
-engine_kwargs = {"echo": False}
-if is_sqlite:
-    engine_kwargs["connect_args"] = {"check_same_thread": False}
-else:
-    engine_kwargs.update({"pool_size": 10, "max_overflow": 20, "pool_pre_ping": True})
+# Use sync SQLite URL (no +aiosqlite)
+_raw = os.getenv("DATABASE_URL", "sqlite:///./data/autocrypto.db")
+DATABASE_URL = _raw.replace("+aiosqlite", "")  # strip async driver if present
 
-engine = create_async_engine(DATABASE_URL, **engine_kwargs)
-AsyncSessionLocal = async_sessionmaker(bind=engine, class_=AsyncSession,
-                                        expire_on_commit=False, autoflush=False)
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False},
+    echo=False,
+)
 
-async def get_db():
-    async with AsyncSessionLocal() as session:
-        try:
-            yield session
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            raise
-        finally:
-            await session.close()
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
-async def init_db():
-    from backend.models.db_models import Base
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    logger.info("DB initialised")
 
-async def check_db() -> bool:
+@contextmanager
+def get_session():
+    """Sync context manager — use as: with get_session() as db: ..."""
+    session = SessionLocal()
     try:
-        async with AsyncSessionLocal() as s:
-            await s.execute(text("SELECT 1"))
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def init_db():
+    """Create all tables."""
+    from backend.models.db_models import Base
+    Base.metadata.create_all(bind=engine)
+    logger.info("DB initialised (sync SQLite)")
+
+
+def check_db() -> bool:
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
         return True
     except Exception:
         return False

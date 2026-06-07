@@ -1,99 +1,106 @@
-"""Background scheduler — signal engine, risk, alerts, reports."""
-import asyncio, time
+"""Scheduler — background thread, sync functions, no asyncio."""
+import threading, time
 from datetime import datetime, timezone, timedelta
 from loguru import logger
 
-_tasks = []
-CANDLE_SECONDS = {"1m":60,"5m":300,"15m":900,"1h":3600,"4h":14400,"1d":86400}
+_thread: threading.Thread = None
+_stop_event = threading.Event()
+CANDLE_SECS = {"1m":60,"5m":300,"15m":900,"1h":3600,"4h":14400,"1d":86400}
 
 
-async def start_all():
-    logger.info("Starting schedulers…")
-    _tasks.clear()
-    _tasks.append(asyncio.create_task(_engine_loop(),   name="engine"))
-    _tasks.append(asyncio.create_task(_risk_loop(),     name="risk"))
-    _tasks.append(asyncio.create_task(_alert_loop(),    name="alerts"))
-    _tasks.append(asyncio.create_task(_snap_loop(),     name="snap"))
-    _tasks.append(asyncio.create_task(_report_loop(),   name="report"))
-    logger.info(f"{len(_tasks)} tasks started")
+def start_all():
+    global _thread, _stop_event
+    _stop_event.clear()
+    _thread = threading.Thread(target=_main_loop, daemon=True, name="autocrypto_scheduler")
+    _thread.start()
+    logger.info("Scheduler started (sync thread)")
 
-async def stop_all():
-    for t in _tasks: t.cancel()
-    await asyncio.gather(*_tasks, return_exceptions=True)
-    logger.info("Schedulers stopped")
 
-async def _engine_loop():
-    # Run once immediately on start (so signals aren't delayed by full interval)
-    await asyncio.sleep(5)  # brief startup delay
-    while True:
-        try:
-            if await _active():
+def stop_all():
+    _stop_event.set()
+    logger.info("Scheduler stop requested")
+
+
+def _main_loop():
+    last_engine  = 0.0
+    last_risk    = 0.0
+    last_alert   = 0.0
+    last_snap    = 0.0
+    last_report  = 0.0
+
+    # Run engine once immediately on start (5s delay for DB init)
+    time.sleep(5)
+
+    while not _stop_event.is_set():
+        now = time.time()
+
+        # Signal engine — aligned to candle close
+        interval = _get_interval()
+        period   = CANDLE_SECS.get(interval, 900)
+        engine_due = (now - last_engine) >= period or last_engine == 0
+        if engine_due and _is_active():
+            try:
                 from backend.services.signal_engine import run_signal_engine
-                await run_signal_engine()
-            iv   = await _interval()
-            wait = CANDLE_SECONDS.get(iv, 900) - (time.time() % CANDLE_SECONDS.get(iv, 900))
-            logger.info(f"Engine: next in {wait:.0f}s")
-            await asyncio.sleep(wait)
-        except asyncio.CancelledError: break
-        except Exception as e:
-            logger.error(f"Engine loop: {e}", exc_info=True)
-            await asyncio.sleep(60)
+                run_signal_engine()
+                last_engine = now
+            except Exception as e:
+                logger.error(f"Engine: {e}")
 
-async def _risk_loop():
-    while True:
-        try:
-            if await _active():
+        # Risk checks every 30s
+        if (now - last_risk) >= 30 and _is_active():
+            try:
                 from backend.services.risk_manager import run_risk_checks
-                await run_risk_checks()
-        except asyncio.CancelledError: break
-        except Exception as e: logger.error(f"Risk: {e}")
-        await asyncio.sleep(30)
+                run_risk_checks()
+                last_risk = now
+            except Exception as e:
+                logger.error(f"Risk: {e}")
 
-async def _alert_loop():
-    while True:
-        try:
-            from backend.services.alert_system import process_pending_alerts
-            await process_pending_alerts()
-        except asyncio.CancelledError: break
-        except Exception as e: logger.error(f"Alerts: {e}")
-        await asyncio.sleep(60)
+        # Alert monitor every 60s
+        if (now - last_alert) >= 60:
+            try:
+                from backend.services.alert_system import process_pending_alerts
+                process_pending_alerts()
+                last_alert = now
+            except Exception as e:
+                logger.error(f"Alerts: {e}")
 
-async def _snap_loop():
-    while True:
-        try:
-            await asyncio.sleep(3600)
-            if await _active():
+        # Fund snapshot every hour
+        if (now - last_snap) >= 3600 and _is_active():
+            try:
                 from backend.services.fund_manager import take_fund_snapshot
-                await take_fund_snapshot()
-        except asyncio.CancelledError: break
-        except Exception as e: logger.error(f"Snap: {e}")
+                take_fund_snapshot()
+                last_snap = now
+            except Exception as e:
+                logger.error(f"Snapshot: {e}")
 
-async def _report_loop():
-    while True:
-        try:
-            now = datetime.now(timezone.utc)
-            nxt = now.replace(hour=14,minute=30,second=0,microsecond=0)
-            if nxt <= now: nxt += timedelta(days=1)
-            await asyncio.sleep((nxt-now).total_seconds())
-            from backend.services.daily_reporter import send_daily_report
-            await send_daily_report()
-        except asyncio.CancelledError: break
-        except Exception as e:
-            logger.error(f"Report: {e}")
-            await asyncio.sleep(3600)
+        # Daily report at 14:30 UTC (8 PM IST)
+        dt = datetime.now(timezone.utc)
+        report_due = (dt.hour == 14 and dt.minute == 30 and
+                      (now - last_report) >= 3600)
+        if report_due:
+            try:
+                from backend.services.daily_reporter import send_daily_report
+                send_daily_report()
+                last_report = now
+            except Exception as e:
+                logger.error(f"Report: {e}")
 
-async def _active() -> bool:
+        time.sleep(10)  # poll every 10s
+
+
+def _is_active() -> bool:
     try:
-        from backend.db.database import AsyncSessionLocal
+        from backend.db.database import get_session
         from backend.config.config_manager import get_config
-        async with AsyncSessionLocal() as db:
-            return await get_config(db,"bot_active") == "true"
+        with get_session() as db:
+            return get_config(db, "bot_active") == "true"
     except Exception: return False
 
-async def _interval() -> str:
+
+def _get_interval() -> str:
     try:
-        from backend.db.database import AsyncSessionLocal
+        from backend.db.database import get_session
         from backend.config.config_manager import get_config
-        async with AsyncSessionLocal() as db:
-            return await get_config(db,"candle_interval") or "15m"
+        with get_session() as db:
+            return get_config(db, "candle_interval") or "15m"
     except Exception: return "15m"
