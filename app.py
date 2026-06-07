@@ -23,12 +23,25 @@ if env_file.exists():
             k, _, v = line.partition("=")
             os.environ.setdefault(k.strip(), v.strip())
 
+# Load from Streamlit secrets first (persists on Streamlit Cloud)
+try:
+    import streamlit as _st_check
+    _secrets = _st_check.secrets
+    for _k in ["CONFIG_ENCRYPTION_KEY", "DATABASE_URL"]:
+        if _k in _secrets and not os.environ.get(_k):
+            os.environ[_k] = _secrets[_k]
+except Exception:
+    pass
+
 if not os.environ.get("CONFIG_ENCRYPTION_KEY"):
     from cryptography.fernet import Fernet
     key = Fernet.generate_key().decode()
     os.environ["CONFIG_ENCRYPTION_KEY"] = key
-    with open(env_file, "a") as f:
-        f.write(f"\nCONFIG_ENCRYPTION_KEY={key}\n")
+    try:
+        with open(env_file, "a") as f:
+            f.write(f"\nCONFIG_ENCRYPTION_KEY={key}\n")
+    except Exception:
+        pass  # Read-only filesystem on Streamlit Cloud — key only lasts session
 
 os.makedirs(ROOT / "data", exist_ok=True)
 
@@ -152,24 +165,36 @@ with st.sidebar:
 # ═══════════════════════════════════════════════════════════════════════════════
 if page == "🏠 Overview":
     st.title("Overview")
+    # Agent 1 fix: extract ALL primitive values inside session — prevents DetachedInstanceError
     with get_session() as db:
-        snap    = db.execute(select(FundSnapshot).order_by(desc(FundSnapshot.snapshot_at)).limit(1)).scalar_one_or_none()
-        sigs    = db.execute(select(Signal).order_by(desc(Signal.received_at)).limit(8)).scalars().all()
-        trades  = db.execute(select(Trade).order_by(desc(Trade.opened_at)).limit(8)).scalars().all()
+        _snap   = db.execute(select(FundSnapshot).order_by(desc(FundSnapshot.snapshot_at)).limit(1)).scalar_one_or_none()
+        _sigs   = db.execute(select(Signal).order_by(desc(Signal.received_at)).limit(8)).scalars().all()
+        _trades = db.execute(select(Trade).order_by(desc(Trade.opened_at)).limit(8)).scalars().all()
         open_c  = len(db.execute(select(Trade).where(Trade.status==TradeStatus.OPEN)).scalars().all())
-        alerts  = db.execute(select(Alert).where(Alert.resolved==False,Alert.level.in_([AlertLevel.CRITICAL,AlertLevel.WARNING])).limit(5)).scalars().all()
+        _alerts = db.execute(select(Alert).where(Alert.resolved==False,Alert.level.in_([AlertLevel.CRITICAL,AlertLevel.WARNING])).limit(5)).scalars().all()
         iv      = get_config(db,"candle_interval") or "15m"
         pairs   = get_config(db,"trading_pairs") or ""
         starting= get_config(db,"starting_capital") or "0"
+        # Extract primitives while session is open
+        snap_data = {
+            "tb": float(_snap.total_balance), "av": float(_snap.available),
+            "lk": float(_snap.locked_25pct), "pd": float(_snap.pnl_today)
+        } if _snap else None
+        sigs = [{"dir": str(s.direction.value), "pair": s.pair, "price": float(s.price),
+                 "processed": s.processed, "rejected": s.rejected,
+                 "reason": s.reject_reason or "", "at": s.received_at} for s in _sigs]
+        trades = [{"dir": str(t.direction.value), "pair": t.pair,
+                   "pnl": float(t.pnl) if t.pnl else None,
+                   "status": t.status.value, "at": t.opened_at} for t in _trades]
+        alerts = [{"level": a.level, "cat": a.category, "msg": a.message} for a in _alerts]
 
     for a in alerts:
-        if a.level==AlertLevel.CRITICAL: st.error(f"🚨 {a.category}: {a.message}")
-        else: st.warning(f"⚠️ {a.category}: {a.message}")
+        if a["level"]==AlertLevel.CRITICAL: st.error(f"🚨 {a['cat']}: {a['msg']}")
+        else: st.warning(f"⚠️ {a['cat']}: {a['msg']}")
 
     c1,c2,c3,c4 = st.columns(4)
-    if snap:
-        tb=float(snap.total_balance); av=float(snap.available)
-        lk=float(snap.locked_25pct); pd=float(snap.pnl_today)
+    if snap_data:
+        tb=snap_data["tb"]; av=snap_data["av"]; lk=snap_data["lk"]; pd=snap_data["pd"]
         pc="green" if pd>=0 else "red"
         c1.markdown(mc("Total Fund",inr(tb))             , unsafe_allow_html=True)
         c2.markdown(mc("Available",inr(av),"","green")   , unsafe_allow_html=True)
@@ -187,13 +212,13 @@ if page == "🏠 Overview":
         st.markdown("#### 📡 Recent Signals")
         if sigs:
             for s in sigs:
-                dc="#48bb78" if str(s.direction.value)=="buy" else "#fc8181"
+                dc="#48bb78" if s["dir"]=="buy" else "#fc8181"
+                st_txt="✓" if s["processed"] else ("✗ "+s["reason"] if s["rejected"] else "⏳")
                 st.markdown(f'<div style="padding:8px;border-bottom:1px solid rgba(255,255,255,0.05)">'
-                    f'<span style="color:{dc};font-weight:600">{s.direction.value.upper()}</span> '
-                    f'<strong style="color:#e2e8f0">{s.pair}</strong> @ {inr(s.price)} '
-                    f'<span style="color:#718096;font-size:12px">'
-                    f'{"✓" if s.processed else "✗ "+s.reject_reason if s.rejected else "⏳"} · {ago(s.received_at)}'
-                    f'</span></div>', unsafe_allow_html=True)
+                    f'<span style="color:{dc};font-weight:600">{s["dir"].upper()}</span> '
+                    f'<strong style="color:#e2e8f0">{s["pair"]}</strong> @ {inr(s["price"])} '
+                    f'<span style="color:#718096;font-size:12px">{st_txt} · {ago(s["at"])}</span>'
+                    f'</div>', unsafe_allow_html=True)
         else:
             st.markdown('<div class="ib">No signals yet. Start the bot to begin analysis.</div>', unsafe_allow_html=True)
 
@@ -201,13 +226,13 @@ if page == "🏠 Overview":
         st.markdown("#### 💹 Recent Trades")
         if trades:
             for t in trades:
-                dc="#48bb78" if str(t.direction.value)=="buy" else "#fc8181"
-                pnl=float(t.pnl or 0); pc="#48bb78" if pnl>=0 else "#fc8181"
-                pstr=f' <span style="color:{pc}">{inr(pnl)}</span>' if t.pnl else ""
+                dc="#48bb78" if t["dir"]=="buy" else "#fc8181"
+                pnl=t["pnl"]; pc="#48bb78" if (pnl or 0)>=0 else "#fc8181"
+                pstr=f' <span style="color:{pc}">{inr(pnl)}</span>' if pnl is not None else ""
                 st.markdown(f'<div style="padding:8px;border-bottom:1px solid rgba(255,255,255,0.05)">'
-                    f'<span style="color:{dc};font-weight:600">{t.direction.value.upper()}</span> '
-                    f'<strong style="color:#e2e8f0">{t.pair}</strong>{pstr} '
-                    f'<span style="color:#718096;font-size:12px">{t.status.value} · {ago(t.opened_at)}</span>'
+                    f'<span style="color:{dc};font-weight:600">{t["dir"].upper()}</span> '
+                    f'<strong style="color:#e2e8f0">{t["pair"]}</strong>{pstr} '
+                    f'<span style="color:#718096;font-size:12px">{t["status"]} · {ago(t["at"])}</span>'
                     f'</div>', unsafe_allow_html=True)
         else:
             st.markdown('<div class="ib">No trades yet.</div>', unsafe_allow_html=True)
@@ -321,7 +346,11 @@ elif page == "📡 Signal Engine":
         iv     = get_config(db,"candle_interval") or "15m"
         pairs  = get_config(db,"trading_pairs") or ",".join(RECOMMENDED_PAIRS)
         active = get_config(db,"bot_active") == "true"
-        sigs   = db.execute(select(Signal).order_by(desc(Signal.received_at)).limit(20)).scalars().all()
+        _sigs  = db.execute(select(Signal).order_by(desc(Signal.received_at)).limit(20)).scalars().all()
+        sigs   = [{"id":s.id,"pair":s.pair,"dir":s.direction.value.upper(),
+                   "price":float(s.price),"atr":float(s.atr) if s.atr else None,
+                   "processed":s.processed,"rejected":s.rejected,
+                   "reason":s.reject_reason or "","at":s.received_at} for s in _sigs]
 
     pairs_list = [p.strip() for p in pairs.split(",") if p.strip()]
     CSECS = {"1m":60,"5m":300,"15m":900,"1h":3600,"4h":14400,"1d":86400}
@@ -390,10 +419,10 @@ elif page == "📡 Signal Engine":
     if sigs:
         import pandas as pd
         st.dataframe(pd.DataFrame([{
-            "ID":s.id,"Pair":s.pair,"Dir":s.direction.value.upper(),
-            "Price":inr(s.price),"ATR":f"{float(s.atr):.4f}" if s.atr else "—",
-            "Status":"✓ Processed" if s.processed else ("✗ "+s.reject_reason if s.rejected else "⏳ Pending"),
-            "Time":ago(s.received_at),
+            "ID":s["id"],"Pair":s["pair"],"Dir":s["dir"],
+            "Price":inr(s["price"]),"ATR":f"{s['atr']:.4f}" if s["atr"] else "—",
+            "Status":"✓ Processed" if s["processed"] else ("✗ "+s["reason"] if s["rejected"] else "⏳ Pending"),
+            "Time":ago(s["at"]),
         } for s in sigs]), use_container_width=True, hide_index=True)
     else:
         st.info("No signals yet. Start bot — engine runs immediately then every candle close.")
@@ -475,28 +504,44 @@ elif page == "📰 Market Intel":
 elif page == "💹 Trades":
     st.title("Trades")
     with get_session() as db:
-        trades = db.execute(select(Trade).order_by(desc(Trade.opened_at)).limit(100)).scalars().all()
-    open_t=[ t for t in trades if t.status==TradeStatus.OPEN]
-    closed_t=[t for t in trades if t.status==TradeStatus.CLOSED]
-    won=[t for t in closed_t if t.pnl and float(t.pnl)>0]
-    total_pnl=sum(float(t.pnl or 0) for t in closed_t)
+        _trades = db.execute(select(Trade).order_by(desc(Trade.opened_at)).limit(100)).scalars().all()
+        # Extract ALL primitives inside session
+        trades = [{
+            "id":t.id, "pair":t.pair, "dir":t.direction.value.upper(),
+            "status":t.status.value,
+            "entry":float(t.entry_price) if t.entry_price else None,
+            "exit":float(t.exit_price) if t.exit_price else None,
+            "sl":float(t.stop_loss_price) if t.stop_loss_price else None,
+            "qty":float(t.quantity),
+            "pnl":float(t.pnl) if t.pnl else None,
+            "pnl_pct":float(t.pnl_pct) if t.pnl_pct else None,
+            "opened_at":t.opened_at, "closed_at":t.closed_at,
+            "is_open": t.status.value == "open",
+            "is_closed": t.status.value == "closed",
+        } for t in _trades]
+    open_c   = sum(1 for t in trades if t["is_open"])
+    closed_t = [t for t in trades if t["is_closed"]]
+    won      = [t for t in closed_t if (t["pnl"] or 0) > 0]
+    total_pnl= sum(t["pnl"] or 0 for t in closed_t)
     c1,c2,c3,c4=st.columns(4)
     pc="green" if total_pnl>=0 else "red"
     wr=round(len(won)/len(closed_t)*100 if closed_t else 0,1)
-    c1.markdown(mc("Open",str(len(open_t)),"","amber"), unsafe_allow_html=True)
+    c1.markdown(mc("Open",str(open_c),"","amber"), unsafe_allow_html=True)
     c2.markdown(mc("Closed",str(len(closed_t)),"","blue"), unsafe_allow_html=True)
     c3.markdown(mc("Win Rate",f"{wr}%",f"{len(won)}W / {len(closed_t)-len(won)}L","green"), unsafe_allow_html=True)
     c4.markdown(mc("Total P&L",inr(total_pnl),"",pc), unsafe_allow_html=True)
     if trades:
         import pandas as pd
         st.dataframe(pd.DataFrame([{
-            "ID":t.id,"Pair":t.pair,"Dir":t.direction.value.upper(),"Status":t.status.value,
-            "Entry":inr(t.entry_price) if t.entry_price else "—",
-            "Exit":inr(t.exit_price) if t.exit_price else "—",
-            "SL":inr(t.stop_loss_price) if t.stop_loss_price else "—",
-            "Qty":round(float(t.quantity),6),"P&L":inr(t.pnl) if t.pnl else "—",
-            "P&L%":pct(t.pnl_pct) if t.pnl_pct else "—",
-            "Opened":ago(t.opened_at),"Closed":ago(t.closed_at) if t.closed_at else "—",
+            "ID":t["id"], "Pair":t["pair"], "Dir":t["dir"], "Status":t["status"],
+            "Entry":inr(t["entry"]) if t["entry"] else "—",
+            "Exit":inr(t["exit"]) if t["exit"] else "—",
+            "SL":inr(t["sl"]) if t["sl"] else "—",
+            "Qty":round(t["qty"],6),
+            "P&L":inr(t["pnl"]) if t["pnl"] is not None else "—",
+            "P&L%":pct(t["pnl_pct"]) if t["pnl_pct"] is not None else "—",
+            "Opened":ago(t["opened_at"]),
+            "Closed":ago(t["closed_at"]) if t["closed_at"] else "—",
         } for t in trades]), use_container_width=True, hide_index=True)
     else:
         st.info("No trades yet.")
@@ -507,20 +552,33 @@ elif page == "💹 Trades":
 elif page == "💰 Fund":
     st.title("Fund")
     with get_session() as db:
-        snap    = db.execute(select(FundSnapshot).order_by(desc(FundSnapshot.snapshot_at)).limit(1)).scalar_one_or_none()
-        reports = db.execute(select(DailyReport).order_by(desc(DailyReport.report_date)).limit(30)).scalars().all()
-        starting= get_config(db,"starting_capital") or "0"
+        _snap    = db.execute(select(FundSnapshot).order_by(desc(FundSnapshot.snapshot_at)).limit(1)).scalar_one_or_none()
+        _reports = db.execute(select(DailyReport).order_by(desc(DailyReport.report_date)).limit(30)).scalars().all()
+        starting = get_config(db,"starting_capital") or "0"
+        # Extract primitives inside session
+        snap_d = {
+            "tb": float(_snap.total_balance), "av": float(_snap.available),
+            "lk": float(_snap.locked_25pct), "pt": float(_snap.pnl_total),
+            "milestone": bool(_snap.milestone_hit),
+        } if _snap else None
+        reports = [{
+            "date": r.report_date.strftime("%d %b %Y") if r.report_date else "—",
+            "start": float(r.starting_fund), "end": float(r.ending_fund),
+            "locked": float(r.locked_fund), "trades": r.trades_count,
+            "won": r.winning_trades, "lost": r.losing_trades,
+            "pnl_day": float(r.pnl_day), "pnl_total": float(r.pnl_total),
+            "email": r.email_sent,
+        } for r in _reports]
 
-    if snap:
-        tb=float(snap.total_balance); av=float(snap.available)
-        lk=float(snap.locked_25pct); pt=float(snap.pnl_total)
+    if snap_d:
+        tb=snap_d["tb"]; av=snap_d["av"]; lk=snap_d["lk"]; pt=snap_d["pt"]
         pc="green" if pt>=0 else "red"
         c1,c2,c3,c4=st.columns(4)
         c1.markdown(mc("Total Balance",inr(tb)), unsafe_allow_html=True)
         c2.markdown(mc("Available",inr(av),"","green"), unsafe_allow_html=True)
         c3.markdown(mc("Locked (Protected)",inr(lk),"","amber"), unsafe_allow_html=True)
         c4.markdown(mc("All-time P&L",inr(pt),"",pc), unsafe_allow_html=True)
-        if snap.milestone_hit: st.success("🎉 Profit milestone! Funds locked for protection.")
+        if snap_d["milestone"]: st.success("🎉 Profit milestone! Funds locked for protection.")
     else:
         st.markdown(f'<div class="wb">⚠️ No exchange sync yet. Configured: <strong>₹{float(starting):,.2f}</strong> — NOT real exchange balance. Click Sync to fetch.</div>', unsafe_allow_html=True)
 
@@ -540,11 +598,11 @@ elif page == "💰 Fund":
         import pandas as pd
         st.markdown("#### Daily Reports")
         st.dataframe(pd.DataFrame([{
-            "Date":r.report_date.strftime("%d %b %Y") if r.report_date else "—",
-            "Start":inr(r.starting_fund),"End":inr(r.ending_fund),"Locked":inr(r.locked_fund),
-            "Trades":r.trades_count,"W/L":f"{r.winning_trades}W/{r.losing_trades}L",
-            "Day P&L":inr(r.pnl_day),"Total P&L":inr(r.pnl_total),
-            "Email":"✓" if r.email_sent else "—",
+            "Date":r["date"],"Start":inr(r["start"]),"End":inr(r["end"]),
+            "Locked":inr(r["locked"]),"Trades":r["trades"],
+            "W/L":f"{r['won']}W/{r['lost']}L",
+            "Day P&L":inr(r["pnl_day"]),"Total P&L":inr(r["pnl_total"]),
+            "Email":"✓" if r["email"] else "—",
         } for r in reports]), use_container_width=True, hide_index=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -553,18 +611,23 @@ elif page == "💰 Fund":
 elif page == "🔔 Alerts":
     st.title("Alerts")
     with get_session() as db:
-        alerts = db.execute(select(Alert).order_by(desc(Alert.created_at)).limit(50)).scalars().all()
-    unresolved=[a for a in alerts if not a.resolved]
+        _alerts = db.execute(select(Alert).order_by(desc(Alert.created_at)).limit(50)).scalars().all()
+        alerts = [{
+            "id":a.id, "level":a.level.value.upper(), "cat":a.category,
+            "msg":a.message[:100], "resolved":a.resolved, "at":a.created_at,
+        } for a in _alerts]
+    unresolved = [a for a in alerts if not a["resolved"]]
     if unresolved: st.warning(f"{len(unresolved)} unresolved alert(s)")
     else: st.success("All clear — no active alerts")
     if alerts:
         import pandas as pd
         st.dataframe(pd.DataFrame([{
-            "ID":a.id,"Level":a.level.value.upper(),"Category":a.category,
-            "Message":a.message[:100],"Resolved":"✓" if a.resolved else "—","Time":ago(a.created_at),
+            "ID":a["id"],"Level":a["level"],"Category":a["cat"],
+            "Message":a["msg"],"Resolved":"✓" if a["resolved"] else "—","Time":ago(a["at"]),
         } for a in alerts]), use_container_width=True, hide_index=True)
         if unresolved:
-            aid=st.number_input("Alert ID to resolve", min_value=1, step=1, value=unresolved[0].id)
+            first_id = unresolved[0]["id"]
+            aid=st.number_input("Alert ID to resolve", min_value=1, step=1, value=first_id)
             if st.button("Mark Resolved"):
                 with get_session() as db:
                     a=db.execute(select(Alert).where(Alert.id==int(aid))).scalar_one_or_none()
