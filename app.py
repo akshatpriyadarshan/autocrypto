@@ -7,45 +7,57 @@ import os, sys, threading, time
 from datetime import datetime, timezone
 from pathlib import Path
 
-# ── Paths & env ───────────────────────────────────────────────────────────────
+# ── Paths ─────────────────────────────────────────────────────────────────────
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
+os.makedirs(ROOT / "data", exist_ok=True)
 
-# Sync SQLite URL — no aiosqlite
-_raw = os.getenv("DATABASE_URL", f"sqlite:///{ROOT}/data/autocrypto.db")
-os.environ["DATABASE_URL"] = _raw.replace("+aiosqlite", "")
+# ── STEP 1: Load Streamlit secrets FIRST (before anything else) ───────────────
+# Must happen before any backend import that might call _get_fernet()
+import streamlit as st
+try:
+    for _k, _v in st.secrets.items():
+        if isinstance(_v, str):
+            # Always overwrite env — secrets are the authoritative source
+            os.environ[_k] = _v
+except Exception:
+    pass  # No secrets configured yet — that's fine
 
+# ── STEP 2: Load .env file (lower priority than secrets) ─────────────────────
 env_file = ROOT / ".env"
 if env_file.exists():
     for line in env_file.read_text().splitlines():
         line = line.strip()
         if line and not line.startswith("#") and "=" in line:
             k, _, v = line.partition("=")
+            # setdefault: secrets already set take priority
             os.environ.setdefault(k.strip(), v.strip())
 
-# Load from Streamlit secrets first (persists on Streamlit Cloud)
-try:
-    import streamlit as _st_check
-    _secrets = _st_check.secrets
-    for _k in ["CONFIG_ENCRYPTION_KEY", "DATABASE_URL"]:
-        if _k in _secrets and not os.environ.get(_k):
-            os.environ[_k] = _secrets[_k]
-except Exception:
-    pass
+# ── STEP 3: Fix DATABASE_URL — strip aiosqlite if present ────────────────────
+_raw = os.getenv("DATABASE_URL", f"sqlite:///{ROOT}/data/autocrypto.db")
+os.environ["DATABASE_URL"] = _raw.replace("+aiosqlite", "")
 
+# ── STEP 4: Ensure valid Fernet key ──────────────────────────────────────────
 if not os.environ.get("CONFIG_ENCRYPTION_KEY"):
     from cryptography.fernet import Fernet
-    key = Fernet.generate_key().decode()
-    os.environ["CONFIG_ENCRYPTION_KEY"] = key
+    _key = Fernet.generate_key().decode()
+    os.environ["CONFIG_ENCRYPTION_KEY"] = _key
     try:
-        with open(env_file, "a") as f:
-            f.write(f"\nCONFIG_ENCRYPTION_KEY={key}\n")
+        with open(env_file, "a") as _f:
+            _f.write(f"\nCONFIG_ENCRYPTION_KEY={_key}\n")
+        st.warning("⚠️ Generated new encryption key. Add CONFIG_ENCRYPTION_KEY to Streamlit secrets to persist across restarts.", icon="🔑")
     except Exception:
-        pass  # Read-only filesystem on Streamlit Cloud — key only lasts session
-
-os.makedirs(ROOT / "data", exist_ok=True)
-
-import streamlit as st
+        pass
+else:
+    # Validate the key is proper Fernet format
+    try:
+        from cryptography.fernet import Fernet as _F
+        _F(os.environ["CONFIG_ENCRYPTION_KEY"].encode())
+    except Exception:
+        from cryptography.fernet import Fernet
+        _key = Fernet.generate_key().decode()
+        os.environ["CONFIG_ENCRYPTION_KEY"] = _key
+        st.error("⚠️ Invalid Fernet key in secrets/env. Generated new key — re-save your setup.", icon="🔑")
 st.set_page_config(page_title="AutoCrypto Trader", page_icon="📈",
                    layout="wide", initial_sidebar_state="expanded")
 
@@ -83,7 +95,7 @@ def cfg(key):
 def set_cfg(key, val, secret=False):
     with get_session() as db:
         set_config(db, key, val, is_secret=secret)
-        db.commit()
+        # context manager commits on exit — no explicit commit needed
 
 def all_cfg():
     with get_session() as db: return get_all_config_plain(db)
@@ -330,10 +342,22 @@ elif page == "⚙️ Setup":
                 "profit_lock_threshold":str(lock_thr),"profit_lock_pct":str(lock_pct_v),
                 "setup_complete":"true","bot_active":current_bot,
             }
-            with get_session() as db:
-                bulk_set_config(db, data, secret_keys=SECRET_KEYS)
-            st.success("✅ Setup saved! Start Bot from the sidebar.")
-            if not is_edit: st.balloons()
+            try:
+                with get_session() as db:
+                    # bulk_set_config does flush+commit internally
+                    # get_session() context manager also commits on clean exit
+                    # To avoid double-commit: set each key without internal commit
+                    for k, v in data.items():
+                        set_config(db, k, v, is_secret=(k in SECRET_KEYS))
+                    # Single commit via context manager exit
+                # Reset fernet cache so new key takes effect immediately
+                from backend.config.config_manager import reset_fernet
+                reset_fernet()
+                st.success("✅ Setup saved! Start Bot from the sidebar.")
+                if not is_edit: st.balloons()
+            except Exception as _e:
+                st.error(f"Save failed: {_e}")
+                st.info("Check Streamlit logs (Manage App → Logs) for details.")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SIGNAL ENGINE
@@ -632,7 +656,7 @@ elif page == "🔔 Alerts":
                 with get_session() as db:
                     a=db.execute(select(Alert).where(Alert.id==int(aid))).scalar_one_or_none()
                     if a:
-                        a.resolved=True; a.resolved_at=datetime.now(timezone.utc); db.commit()
+                        a.resolved=True; a.resolved_at=datetime.now(timezone.utc)  # committed by context manager on exit
                         st.success("Resolved"); st.rerun()
     else:
         st.info("No alerts yet.")

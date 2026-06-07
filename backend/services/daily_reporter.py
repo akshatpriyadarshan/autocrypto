@@ -28,7 +28,7 @@ def send_daily_report():
                 pnl_total=Decimal(str(data["pnl_total"])),
                 email_sent=sent,
             ))
-            db.commit()
+            # committed by get_session() on exit
         except Exception as e:
             logger.error(f"Daily report: {e}", exc_info=True)
 

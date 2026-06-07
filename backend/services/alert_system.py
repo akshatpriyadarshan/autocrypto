@@ -18,7 +18,7 @@ def process_pending_alerts():
         for alert in alerts:
             _email_alert(db, alert)
             alert.notified = True
-        db.commit()
+        # committed by get_session() context manager
 
 
 def _email_alert(db, alert: Alert):

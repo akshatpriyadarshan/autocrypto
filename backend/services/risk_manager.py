@@ -18,7 +18,7 @@ def _check_open_trades():
         trades = db.execute(select(Trade).where(Trade.status==TradeStatus.OPEN)).scalars().all()
         for trade in trades:
             _eval_trade(db, trade)
-        db.commit()
+        # committed by get_session() on exit
 
 
 def _eval_trade(db, trade: Trade):
@@ -58,4 +58,4 @@ def _check_drawdown():
             set_config(db, "bot_active", "false")
             db.add(Alert(level=AlertLevel.CRITICAL, category="drawdown",
                 message=f"Bot stopped: {dd:.1f}% drawdown (max {max_dd}%). Fund: ₹{cf:,.2f}"))
-            db.commit()
+            # committed by get_session() on exit

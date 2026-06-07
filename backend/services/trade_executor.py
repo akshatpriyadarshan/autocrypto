@@ -62,13 +62,13 @@ def execute_trade(trade_id: int):
             trade.exchange_order_id = str(order.get("id",""))
             trade.status = TradeStatus.OPEN
             if fill > 0: trade.entry_price = Decimal(str(round(fill,8)))
-            db.commit()
+            # committed by get_session() on exit
             logger.info(f"Trade {trade_id} OPEN fill={fill}")
             take_fund_snapshot_safe()
         except Exception as e:
             trade.status = TradeStatus.FAILED
             trade.notes  = f"FAILED: {e}"
-            db.commit()
+            # committed by get_session() on exit
             logger.error(f"execute_trade {trade_id}: {e}")
 
 def close_trade_market(trade_id: int, exit_price: float, reason: str = "signal"):
@@ -89,7 +89,7 @@ def close_trade_market(trade_id: int, exit_price: float, reason: str = "signal")
             trade.pnl_pct   = Decimal(str(round(pnl_pct,4)))
             trade.closed_at = datetime.now(timezone.utc)
             trade.notes     = (trade.notes or "") + f" | {reason}"
-            db.commit()
+            # committed by get_session() on exit
             logger.info(f"Trade {trade_id} CLOSED pnl=₹{pnl:.2f}")
             take_fund_snapshot_safe()
         except Exception as e:

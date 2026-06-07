@@ -126,7 +126,7 @@ def _analyse(pair: str, interval: str):
             raw_payload=f"{interval}|rsi={curr['rsi']:.1f}|vol={vol_spike}",
             processed=False, rejected=False,
         )
-        db.add(sig); db.flush(); db.commit(); db.refresh(sig)
+        db.add(sig); db.flush(); db.commit(); db.refresh(sig)  # commit needed before refresh()
 
     from backend.services.position_sizer import calculate_stop_loss, calculate_quantity, calculate_tp
     from backend.services.fund_manager import get_available_fund
@@ -152,7 +152,7 @@ def _analyse(pair: str, interval: str):
             fund_at_entry=Decimal(str(round(fund,2))),
             notes=f"Engine|{interval}|rsi={curr['rsi']:.1f}",
         )
-        db.add(trade); db.flush(); db.commit(); db.refresh(trade)
+        db.add(trade); db.flush(); db.commit(); db.refresh(trade)  # commit needed before refresh()
 
     try:
         from backend.services.trade_executor import execute_trade

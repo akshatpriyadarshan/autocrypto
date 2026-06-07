@@ -53,7 +53,7 @@ def take_fund_snapshot() -> dict:
             milestone_hit=milestone,
         )
         db.add(snap)
-        db.commit()
+        # committed by get_session() on exit
         return {"total":total,"available":available,"locked":locked,"pnl_total":pnl_total,"milestone":milestone}
 
 
