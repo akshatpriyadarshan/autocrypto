@@ -26,7 +26,7 @@ def _get_exchange():
         return _exchange
     import ccxt
     with get_session() as db:
-        testnet = get_config(db, "delta_testnet") or "true"
+        testnet = get_config(db, "delta_testnet") or "false"
     _exchange = ccxt.delta({
         "apiKey": DELTA_API_KEY,
         "secret": DELTA_API_SECRET,
@@ -34,9 +34,9 @@ def _get_exchange():
     })
     if testnet == "true":
         _exchange.set_sandbox_mode(True)
-        logger.info("Delta: TESTNET")
+        logger.info("Delta: TESTNET mode")
     else:
-        logger.info("Delta: LIVE")
+        logger.info("Delta: LIVE mode (hardcoded keys)")
     return _exchange
 
 

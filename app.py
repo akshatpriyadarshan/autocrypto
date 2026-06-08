@@ -63,6 +63,7 @@ if "delta_seeded" not in st.session_state:
         if not existing:
             set_config(db, "delta_api_key",    DELTA_API_KEY,    is_secret=True)
             set_config(db, "delta_api_secret", DELTA_API_SECRET, is_secret=True)
+            set_config(db, "delta_testnet",    "false")  # live keys — not testnet
     st.session_state.delta_seeded = True
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -120,7 +121,7 @@ def card(label, val, sub="", color="blue"):
 with st.sidebar:
     st.markdown("### 📈 AutoCrypto Trader")
     st.markdown("---")
-    page = st.radio("", [
+    page = st.radio("Navigation", [
         "🏠 Overview", "⚙️ Setup", "📡 Signals",
         "📰 Market Intel", "💹 Trades", "💰 Fund", "🔔 Alerts"
     ], label_visibility="collapsed")
@@ -236,7 +237,7 @@ elif page == "⚙️ Setup":
         st.markdown("#### 🔑 Delta Exchange")
         # Show pre-configured note
         st.info("✅ Delta API credentials pre-configured for Streamlit Cloud IPs. Testnet/Live toggle below.")
-        testnet = st.checkbox("Use Testnet (uncheck for Live trading)", value=ex("delta_testnet","true")=="true")
+        testnet = st.checkbox("Use Testnet (uncheck for Live trading)", value=ex("delta_testnet","false")=="true")
 
         st.markdown("#### 📬 Email Alerts")
         c1,c2 = st.columns(2)

@@ -33,14 +33,16 @@ def _main_loop():
     # Brief startup delay for DB init
     time.sleep(8)
 
-    # Run engine ONCE immediately on start so user sees signals quickly
+    # Run engine ONCE on start if bot is already active
     if _is_active():
         try:
             from backend.services.signal_engine import run_signal_engine
             run_signal_engine()
+            logger.info("Startup signal engine run complete")
         except Exception as e:
             logger.error(f"Engine startup: {e}")
     last_engine = time.time()
+    last_snap = time.time()  # don't snapshot immediately on start
 
     while not _stop_event.is_set():
         now      = time.time()
@@ -76,12 +78,13 @@ def _main_loop():
                 logger.error(f"Alerts: {e}")
             last_alert = now
 
-        # Fund snapshot every hour
-        if (now - last_snap) >= 3600:
+        # Fund snapshot every 4 hours (reduce API calls)
+        if (now - last_snap) >= 14400:
             if _is_active():
                 try:
                     from backend.services.fund_manager import take_fund_snapshot
                     take_fund_snapshot()
+                    logger.info("Periodic fund snapshot taken")
                 except Exception as e:
                     logger.error(f"Snapshot: {e}")
             last_snap = now
