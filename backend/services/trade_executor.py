@@ -1,4 +1,7 @@
-"""Delta Exchange trade executor — sync wrapper around ccxt async."""
+"""
+Delta Exchange executor — sync ccxt.
+API keys hardcoded (configured for Streamlit Cloud IPs).
+"""
 from decimal import Decimal
 from datetime import datetime, timezone
 from typing import Optional
@@ -10,19 +13,25 @@ from backend.models.db_models import Trade, TradeStatus, TradeDirection, Alert, 
 from backend.config.config_manager import get_config
 from sqlalchemy import select
 
+# Hardcoded — configured for Streamlit Cloud IPs on Delta Exchange
+DELTA_API_KEY    = "76wEBRrPbx64EUzphk43LIX1kCWrFb"
+DELTA_API_SECRET = "3lJghi3DLRdgeoesLYxfBg5l9jH4Q0HEjLMOkN744dp9dOH4ddiHG6Mv09cH"
+
 _exchange = None
+
 
 def _get_exchange():
     global _exchange
-    if _exchange: return _exchange
+    if _exchange:
+        return _exchange
     import ccxt
     with get_session() as db:
-        key     = get_config(db, "delta_api_key") or ""
-        secret  = get_config(db, "delta_api_secret") or ""
         testnet = get_config(db, "delta_testnet") or "true"
-    if not key or not secret:
-        raise ValueError("Delta API credentials not configured")
-    _exchange = ccxt.delta({"apiKey": key, "secret": secret, "enableRateLimit": True})
+    _exchange = ccxt.delta({
+        "apiKey": DELTA_API_KEY,
+        "secret": DELTA_API_SECRET,
+        "enableRateLimit": True,
+    })
     if testnet == "true":
         _exchange.set_sandbox_mode(True)
         logger.info("Delta: TESTNET")
@@ -30,8 +39,11 @@ def _get_exchange():
         logger.info("Delta: LIVE")
     return _exchange
 
+
 def reset_exchange():
-    global _exchange; _exchange = None
+    global _exchange
+    _exchange = None
+
 
 def get_wallet_balance_sync() -> Optional[float]:
     try:
@@ -40,8 +52,9 @@ def get_wallet_balance_sync() -> Optional[float]:
         usdt = bal.get("USDT", {})
         return float(usdt.get("free") or usdt.get("total") or 0)
     except Exception as e:
-        logger.warning(f"Balance fetch: {e}")
+        logger.warning(f"Balance: {e}")
         return None
+
 
 def get_market_price_sync(pair: str) -> Optional[float]:
     try:
@@ -52,57 +65,65 @@ def get_market_price_sync(pair: str) -> Optional[float]:
         logger.warning(f"Price {pair}: {e}")
         return None
 
+
 def execute_trade(trade_id: int):
     with get_session() as db:
         trade = db.execute(select(Trade).where(Trade.id == trade_id)).scalar_one_or_none()
-        if not trade or trade.status != TradeStatus.PENDING: return
+        if not trade or trade.status != TradeStatus.PENDING:
+            return
         try:
             order = _place_order(str(trade.pair), str(trade.direction.value), float(trade.quantity))
             fill  = float(order.get("average") or order.get("price") or 0)
-            trade.exchange_order_id = str(order.get("id",""))
+            trade.exchange_order_id = str(order.get("id", ""))
             trade.status = TradeStatus.OPEN
-            if fill > 0: trade.entry_price = Decimal(str(round(fill,8)))
-            # committed by get_session() on exit
+            if fill > 0:
+                trade.entry_price = Decimal(str(round(fill, 8)))
             logger.info(f"Trade {trade_id} OPEN fill={fill}")
-            take_fund_snapshot_safe()
         except Exception as e:
             trade.status = TradeStatus.FAILED
             trade.notes  = f"FAILED: {e}"
-            # committed by get_session() on exit
             logger.error(f"execute_trade {trade_id}: {e}")
 
-def close_trade_market(trade_id: int, exit_price: float, reason: str = "signal"):
-    with get_session() as db:
-        trade = db.execute(select(Trade).where(Trade.id == trade_id)).scalar_one_or_none()
-        if not trade or trade.status != TradeStatus.OPEN: return
-        try:
-            close_dir = "sell" if trade.direction == TradeDirection.BUY else "buy"
-            order = _place_order(str(trade.pair), close_dir, float(trade.quantity))
-            actual = float(order.get("average") or order.get("price") or exit_price)
-            entry  = float(trade.entry_price or actual)
-            pnl    = (actual-entry)*float(trade.quantity) if trade.direction==TradeDirection.BUY else (entry-actual)*float(trade.quantity)
-            pnl_pct = ((actual-entry)/entry*100) if entry>0 else 0
-            if trade.direction == TradeDirection.SELL: pnl_pct = -pnl_pct
-            trade.status    = TradeStatus.CLOSED
-            trade.exit_price = Decimal(str(round(actual,8)))
-            trade.pnl       = Decimal(str(round(pnl,2)))
-            trade.pnl_pct   = Decimal(str(round(pnl_pct,4)))
-            trade.closed_at = datetime.now(timezone.utc)
-            trade.notes     = (trade.notes or "") + f" | {reason}"
-            # committed by get_session() on exit
-            logger.info(f"Trade {trade_id} CLOSED pnl=₹{pnl:.2f}")
-            take_fund_snapshot_safe()
-        except Exception as e:
-            logger.error(f"close_trade {trade_id}: {e}")
-
-def take_fund_snapshot_safe():
     try:
         from backend.services.fund_manager import take_fund_snapshot
         take_fund_snapshot()
     except Exception as e:
-        logger.error(f"Snapshot: {e}")
+        logger.error(f"Snapshot after open: {e}")
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2,max=10), reraise=True)
+
+def close_trade_market(trade_id: int, exit_price: float, reason: str = "signal"):
+    with get_session() as db:
+        trade = db.execute(select(Trade).where(Trade.id == trade_id)).scalar_one_or_none()
+        if not trade or trade.status != TradeStatus.OPEN:
+            return
+        try:
+            close_dir = "sell" if trade.direction == TradeDirection.BUY else "buy"
+            order  = _place_order(str(trade.pair), close_dir, float(trade.quantity))
+            actual = float(order.get("average") or order.get("price") or exit_price)
+            entry  = float(trade.entry_price or actual)
+            pnl    = (actual - entry) * float(trade.quantity) if trade.direction == TradeDirection.BUY \
+                     else (entry - actual) * float(trade.quantity)
+            pnl_pct = ((actual - entry) / entry * 100) if entry > 0 else 0
+            if trade.direction == TradeDirection.SELL:
+                pnl_pct = -pnl_pct
+            trade.status     = TradeStatus.CLOSED
+            trade.exit_price = Decimal(str(round(actual, 8)))
+            trade.pnl        = Decimal(str(round(pnl, 2)))
+            trade.pnl_pct    = Decimal(str(round(pnl_pct, 4)))
+            trade.closed_at  = datetime.now(timezone.utc)
+            trade.notes      = (trade.notes or "") + f" | {reason}"
+            logger.info(f"Trade {trade_id} CLOSED pnl=₹{pnl:.2f}")
+        except Exception as e:
+            logger.error(f"close_trade {trade_id}: {e}")
+
+    try:
+        from backend.services.fund_manager import take_fund_snapshot
+        take_fund_snapshot()
+    except Exception as e:
+        logger.error(f"Snapshot after close: {e}")
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10), reraise=True)
 def _place_order(pair: str, side: str, qty: float) -> dict:
     ex = _get_exchange()
     logger.info(f"Order: {side.upper()} {pair} qty={qty}")

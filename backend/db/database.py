@@ -1,62 +1,50 @@
 """
-DB engine — synchronous SQLite via SQLAlchemy.
-Pure sync: no aiosqlite, no anyio, no asyncio.
-Works on Python 3.11–3.14.
+DB — sync SQLite. Writes to /tmp/ so it works on Streamlit Cloud (read-only repo).
 """
 import os
 from contextlib import contextmanager
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, event
 from sqlalchemy.orm import sessionmaker, Session
 from loguru import logger
 
-_raw = os.getenv("DATABASE_URL", "sqlite:///./data/autocrypto.db")
-DATABASE_URL = _raw.replace("+aiosqlite", "")
+# /tmp is always writable — on Streamlit Cloud, repo dir is read-only
+DB_PATH = os.getenv("DB_PATH", "/tmp/autocrypto.db")
+DATABASE_URL = f"sqlite:///{DB_PATH}"
+os.environ["DATABASE_URL"] = DATABASE_URL
 
 engine = create_engine(
     DATABASE_URL,
     connect_args={"check_same_thread": False},
     echo=False,
-    # Use NullPool for SQLite to avoid thread issues
-    poolclass=None,
 )
 
-SessionLocal = sessionmaker(
-    bind=engine,
-    autoflush=False,   # manual flush only
-    autocommit=False,
-)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 
 @contextmanager
 def get_session():
-    """
-    Context manager yielding a DB session.
-    Commits on clean exit, rolls back on exception.
-    Callers must NOT call db.commit() themselves —
-    that causes double-commit errors on Python 3.14.
-    """
-    session: Session = SessionLocal()
+    """Yields session. Commits on exit, rolls back on error."""
+    s = SessionLocal()
     try:
-        yield session
-        session.commit()
+        yield s
+        s.commit()
     except Exception:
-        session.rollback()
+        s.rollback()
         raise
     finally:
-        session.close()
+        s.close()
 
 
 def init_db():
-    """Create all tables on startup."""
     from backend.models.db_models import Base
     Base.metadata.create_all(bind=engine)
-    logger.info("DB ready (sync SQLite)")
+    logger.info(f"DB ready at {DB_PATH}")
 
 
 def check_db() -> bool:
     try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
+        with engine.connect() as c:
+            c.execute(text("SELECT 1"))
         return True
     except Exception:
         return False
