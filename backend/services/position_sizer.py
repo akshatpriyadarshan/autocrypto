@@ -17,6 +17,10 @@ def calculate_stop_loss(direction: str, entry: float, sl_type: str,
 
 def calculate_quantity(fund: float, risk_pct: float,
                        entry: float, sl: float) -> float:
+    # Safety: if fund appears to be in INR (very large vs crypto prices), convert to USD
+    # Delta India: 1 USD = 85 INR fixed. BTC ~$60k, so fund >500k likely INR
+    if fund > 50000 and entry > 100:  # heuristic: fund in INR, price in USD
+        fund = fund / 85.0
     if fund <= 0 or entry <= 0: return 0.0
     price_risk = abs(entry - sl)
     if price_risk < 0.000001: return 0.0

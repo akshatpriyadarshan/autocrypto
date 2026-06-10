@@ -18,7 +18,11 @@ DELTA_API_SECRET = "3lJghi3DLRdgeoesLYxfBg5l9jH4Q0HEjLMOkN744dp9dOH4ddiHG6Mv09cH
 
 def take_fund_snapshot() -> dict:
     with get_session() as db:
-        starting = float(get_config(db, "starting_capital") or "0")
+        _cap_raw = float(get_config(db, "starting_capital") or "0")
+        # starting_capital stored in INR by user — convert to USD for internal comparison
+        # Delta India fixed rate: 1 USD = 85 INR
+        USD_TO_INR = 85.0
+        starting = _cap_raw / USD_TO_INR  # USD equivalent
         lock_thr = float(get_config(db, "profit_lock_threshold") or "100")
         lock_pct = float(get_config(db, "profit_lock_pct") or "25")
 

@@ -79,8 +79,15 @@ def set_cfg(key, val, secret=False):
     with get_session() as db:
         set_config(db, key, val, is_secret=secret)
 
-def inr(v):
-    try: return f"₹{float(v or 0):,.2f}"
+# Delta India API returns balances in USD. Fixed rate: 1 USD = 85 INR.
+# All display values multiplied by USD_TO_INR for INR display.
+def inr(v, already_inr=False):
+    """Format as INR. Assumes input is USD unless already_inr=True."""
+    try:
+        amount = float(v or 0)
+        if not already_inr:
+            amount = amount * USD_TO_INR
+        return f"₹{amount:,.2f}"
     except: return "₹0.00"
 
 def pct(v):
@@ -251,7 +258,7 @@ elif page == "⚙️ Setup":
 
         st.markdown("#### 📊 Trading Parameters")
         c1,c2,c3 = st.columns(3)
-        capital    = c1.number_input("Starting Capital (INR ₹)", value=float(ex("starting_capital","10000")), min_value=100.0, step=1000.0)
+        capital    = c1.number_input("Starting Capital (INR ₹)", value=float(ex("starting_capital","10000")), min_value=1000.0, step=1000.0)
         risk_pct   = c2.slider("Risk per Trade %", 0.5, 10.0, float(ex("risk_per_trade_pct","2")), 0.5)
         max_trades = c3.number_input("Max Open Trades", value=int(ex("max_open_trades","3")), min_value=1, max_value=10)
 
@@ -368,25 +375,32 @@ elif page == "📡 Signals":
             if "error" in snap:
                 st.error(f"{pair}: {snap['error']}")
             else:
-                tc = "green" if snap["trend"]=="BULL" else "red"
-                rc = "red" if snap["rsi"]>65 else ("green" if snap["rsi"]<35 else "amber")
-                vc = "green" if snap["vol_spike"] else "red"
+                tc  = "green" if snap["trend"]=="BULL" else "red"
+                rc  = "red" if snap["rsi"]>70 else ("green" if snap["rsi"]<30 else "amber")
+                vc  = "green" if snap["vol_spike"] else "red"
+                ws  = snap.get("would_signal","None")
+                wc  = "#22c55e" if ws=="BUY" else ("#ef4444" if ws=="SELL" else "#64748b")
+                wl  = f"⚡ SIGNAL: {ws}" if ws != "None" else "No signal this candle"
+                # Price: show INR primary, USD secondary
+                price_inr = snap["price"] * USD_TO_INR
                 st.markdown(f"""<div class="mc"><div class="ml">{pair}</div>
-<div class="mv blue">{inr(snap['price'])}</div>
-<div style="font-size:13px;line-height:1.9;margin-top:8px">
+<div class="mv blue">₹{price_inr:,.0f}</div>
+<div style="color:#64748b;font-size:11px;margin-bottom:6px">${snap['price']:,.2f} USD</div>
+<div style="padding:4px 8px;border-radius:6px;font-size:12px;font-weight:600;color:{wc};background:rgba(99,179,237,0.08);margin-bottom:6px">{wl}</div>
+<div style="font-size:12px;line-height:1.8">
 Trend: <span class="{tc}"><b>{snap['trend']}</b></span><br>
-EMA9/21: <code style="color:#e2e8f0">{snap['ema_fast']}/{snap['ema_slow']}</code><br>
+EMA9: <code style="color:#e2e8f0">{snap['ema_fast']}</code> / EMA21: <code style="color:#e2e8f0">{snap['ema_slow']}</code><br>
 RSI: <span class="{rc}"><b>{snap['rsi']}</b></span><br>
 Vol Spike: <span class="{vc}"><b>{"Yes ✓" if snap['vol_spike'] else "No"}</b></span><br>
 <small style="color:#64748b">{snap['cross']}</small>
 </div></div>""", unsafe_allow_html=True)
 
-    st.markdown("#### Strategy: BUY when EMA9 crosses above EMA21 + RSI<65 + Vol spike. SELL opposite.")
+    st.markdown("#### Strategy: BUY when EMA9 crosses **above** EMA21 + RSI < 70. SELL when EMA9 crosses **below** EMA21 + RSI > 30. Volume spike shown but not required.")
 
     if sigs:
         import pandas as pd
         st.dataframe(pd.DataFrame([{
-            "ID":s["id"],"Pair":s["pair"],"Dir":s["dir"],"Price":inr(s["price"]),
+            "ID":s["id"],"Pair":s["pair"],"Dir":s["dir"],"Price (INR)":f"₹{s['price']*USD_TO_INR:,.0f}",
             "ATR":f"{s['atr']:.4f}" if s["atr"] else "—",
             "Status":"✓" if s["ok"] else (f"✗ {s['why']}" if s["rej"] else "⏳"),
             "Time":ago(s["at"]),
@@ -465,11 +479,11 @@ elif page == "💹 Trades":
         import pandas as pd
         st.dataframe(pd.DataFrame([{
             "ID":t["id"],"Pair":t["pair"],"Dir":t["dir"],"Status":t["status"],
-            "Entry":inr(t["entry"]) if t["entry"] else "—",
-            "Exit":inr(t["exit"]) if t["exit"] else "—",
-            "SL":inr(t["sl"]) if t["sl"] else "—",
+            "Entry":f"₹{t['entry']*USD_TO_INR:,.0f}" if t["entry"] else "—",
+            "Exit":f"₹{t['exit']*USD_TO_INR:,.0f}" if t["exit"] else "—",
+            "SL":f"₹{t['sl']*USD_TO_INR:,.0f}" if t["sl"] else "—",
             "Qty":round(t["qty"],6),
-            "P&L":inr(t["pnl"]) if t["pnl"] is not None else "—",
+            "P&L":f"₹{t['pnl']*USD_TO_INR:,.2f}" if t["pnl"] is not None else "—",
             "P&L%":pct(t["pnl_pct"]) if t["pnl_pct"] is not None else "—",
             "Opened":ago(t["opened"]),"Closed":ago(t["closed"]) if t["closed"] else "—",
         } for t in trades]))
@@ -504,8 +518,9 @@ elif page == "💰 Fund":
         c3.markdown(card("Locked (Protected)",inr(snap["lk"]),"","amber"), unsafe_allow_html=True)
         c4.markdown(card("All-time P&L",inr(snap["pt"]),"",pc), unsafe_allow_html=True)
         if snap["ms"]: st.success("🎉 Profit milestone reached!")
+        st.caption(f"Note: Delta India balance in USD × {int(USD_TO_INR)} = INR (fixed rate per Delta Exchange India)")
     else:
-        st.markdown(f'<div class="wb">⚠️ No exchange sync yet. Configured: ₹{float(starting):,.2f} — click Sync below.</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="wb">⚠️ No exchange sync yet. Configured: ₹{float(starting):,.2f} INR. Click Sync to fetch real balance from Delta Exchange.</div>', unsafe_allow_html=True)
 
     if st.button("🔄 Sync Balance from Delta"):
         with st.spinner("Connecting to Delta Exchange…"):
