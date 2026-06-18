@@ -66,14 +66,9 @@ if "delta_seeded" not in st.session_state:
             set_config(db, "delta_api_key",    DELTA_API_KEY,    is_secret=True)
             set_config(db, "delta_api_secret", DELTA_API_SECRET, is_secret=True)
             set_config(db, "delta_testnet",    "false")  # live keys — not testnet
-    st.session_state.delta_seeded = True
-
-# ── Page config ───────────────────────────────────────────────────────────────
-st.set_page_config(page_title="AutoCrypto Trader", page_icon="📈",
-                   layout="wide", initial_sidebar_state="expanded")
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def cfg(key):
+            # Ensure bot auto-starts after reboot by default (user can stop later)
+            if get_config(db, "bot_active") is None:
+                set_config(db, "bot_active", "true")
     with get_session() as db:
         return get_config(db, key)
 
@@ -260,20 +255,25 @@ elif page == "⚙️ Setup":
 
         st.markdown("#### 📊 Trading Parameters")
         c1,c2,c3 = st.columns(3)
-        capital    = c1.number_input("Starting Capital (INR ₹)", value=float(ex("starting_capital","10000")), min_value=1000.0, step=1000.0)
+        # Show starting capital fetched from Delta Exchange instead of manual input
+        from backend.services.trade_executor import get_wallet_balance_sync
+        try:
+            _bal = get_wallet_balance_sync()
+        except Exception:
+            _bal = None
+        cap_display = inr(_bal) if _bal is not None else "Not available"
+        c1.markdown(card("Starting Capital", cap_display, "Fetched from Delta Exchange" if _bal else "Exchange unreachable — will fallback to config"), unsafe_allow_html=True)
         risk_pct   = c2.slider("Risk per Trade %", 0.5, 10.0, float(ex("risk_per_trade_pct","2")), 0.5)
         max_trades = c3.number_input("Max Open Trades", value=int(ex("max_open_trades","3")), min_value=1, max_value=10)
 
         st.markdown("#### 🎯 Pairs & Strategy")
         c1,c2 = st.columns(2)
         spot_sel = c1.multiselect("Spot Pairs",
-            ["BTC/USDT","ETH/USDT","SOL/USDT","XRP/USDT"],
-            default=[p for p in ["BTC/USDT","ETH/USDT","SOL/USDT","XRP/USDT"]
-                     if p in ex("trading_pairs",",".join(RECOMMENDED_PAIRS))])
+            RECOMMENDED_PAIRS,
+            default=[p for p in RECOMMENDED_PAIRS if p in ex("trading_pairs", ",".join(RECOMMENDED_PAIRS))])
         fut_sel  = c2.multiselect("Futures Pairs",
-            ["DOGE/USDT","LINK/USDT","AVAX/USDT","ADA/USDT"],
-            default=[p for p in ["DOGE/USDT","LINK/USDT"]
-                     if p in ex("trading_pairs","")])
+            FUTURES_PAIRS,
+            default=[p for p in FUTURES_PAIRS if p in ex("trading_pairs", ",".join(FUTURES_PAIRS))])
 
         c1,c2,c3 = st.columns(3)
         iv_opts  = ["1m","5m","15m","1h","4h"]
@@ -310,7 +310,6 @@ elif page == "⚙️ Setup":
                 "smtp_user":              smtp_user.strip(),
                 "smtp_password":          smtp_pass,
                 "smtp_use_tls":           str(smtp_tls).lower(),
-                "starting_capital":       str(capital),
                 "risk_per_trade_pct":     str(risk_pct),
                 "stop_loss_type":         sl_type,
                 "stop_loss_fixed_pct":    str(sl_pct),
@@ -343,7 +342,7 @@ elif page == "📡 Signals":
 
     with get_session() as db:
         iv     = get_config(db,"candle_interval") or "15m"
-        pairs  = get_config(db,"trading_pairs") or "BTC/USDT"
+        pairs  = get_config(db,"trading_pairs") or ",".join(RECOMMENDED_PAIRS)
         active = get_config(db,"bot_active") == "true"
         _sigs  = db.execute(select(Signal).order_by(desc(Signal.received_at)).limit(30)).scalars().all()
         sigs   = [{"id":s.id,"pair":s.pair,"dir":s.direction.value.upper(),

@@ -25,7 +25,7 @@ RSI_OS   = 30
 VOL_MULT = 1.2
 USD_TO_INR = 85.0
 
-RECOMMENDED_PAIRS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"]
+RECOMMENDED_PAIRS = ["XRP/USDT", "LINK/USDT", "ADA/USDT"]
 FUTURES_PAIRS     = ["DOGE/USDT", "LINK/USDT", "AVAX/USDT", "ADA/USDT"]
 
 
@@ -71,6 +71,13 @@ def run_signal_engine():
         pairs_raw = get_config(db, "trading_pairs") or ",".join(RECOMMENDED_PAIRS)
         interval  = get_config(db, "candle_interval") or "15m"
         pairs = [p.strip() for p in pairs_raw.split(",") if p.strip()]
+
+        # Focus: if there's an open trade, prioritize that pair(s) — acts on current holdings
+        open_rows = db.execute(select(Trade).where(Trade.status == TradeStatus.OPEN)).scalars().all()
+        if open_rows:
+            focused = list({t.pair for t in open_rows})
+            logger.info(f"Engine focusing on open trades: {focused}")
+            pairs = focused
 
     logger.info(f"Engine | pairs={pairs} interval={interval}")
     generated = 0

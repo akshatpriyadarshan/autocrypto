@@ -1,15 +1,20 @@
 """
-DB — sync SQLite. Engine created lazily so /tmp path is used correctly
-regardless of when services import this module.
+DB — sync SQLite. Engine created lazily.
+By default DB is persisted under the workspace `data/` folder so config
+survives app restarts (not /tmp).
 """
 import os
 from contextlib import contextmanager
+from pathlib import Path
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from loguru import logger
 
-# Always /tmp — writable on Streamlit Cloud
-DB_PATH = "/tmp/autocrypto.db"
+# Persist DB inside project `data/` so setup/config survives restarts.
+ROOT = Path(__file__).resolve().parents[2]
+DATA_DIR = ROOT / "data"
+os.makedirs(DATA_DIR, exist_ok=True)
+DB_PATH = str(DATA_DIR / "autocrypto.db")
 
 _engine = None
 _Session = None
