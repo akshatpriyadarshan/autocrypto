@@ -49,9 +49,19 @@ def _get(path: str) -> dict:
 def _post(path: str, body: dict) -> dict:
     s    = json.dumps(body, separators=(",", ":"))
     r    = httpx.post(f"{BASE_URL}{path}", headers=_sign("POST", path, s), content=s, timeout=10.0)
-    data = r.json()
+    try:
+        data = r.json()
+    except Exception as e:
+        raise RuntimeError(f"Failed to parse API response: {e}")
+    
     if not data.get("success"):
-        raise RuntimeError(f"Delta API: {data.get('error', data)}")
+        error = data.get("error", data)
+        raise RuntimeError(f"Delta API error: {error}")
+    
+    result = data.get("result")
+    if result is None:
+        raise RuntimeError("API returned success=true but no result field")
+    
     return data
 
 
@@ -110,7 +120,8 @@ def _place_order(pair: str, side: str, qty: float) -> dict:
     pid  = _get_product_id(sym)
     if not pid:
         raise RuntimeError(f"Product not found: {sym}")
-    size = int(round(qty)) if qty >= 1 else qty
+    # Keep decimal precision for crypto — always use float
+    size = float(round(qty, 8))
     body = {"product_id": pid, "size": size, "side": side.lower(),
             "order_type": "market_order", "time_in_force": "ioc"}
     logger.info(f"Order: {side.upper()} {sym} size={size} pid={pid}")
@@ -127,12 +138,37 @@ def execute_trade(trade_id: int):
             return
         try:
             res  = _place_order(str(trade.pair), str(trade.direction.value), float(trade.quantity))
-            fill = float(res.get("average_fill_price") or res.get("limit_price") or 0)
-            trade.exchange_order_id = str(res.get("id", ""))
-            trade.status            = TradeStatus.OPEN
-            if fill > 0:
-                trade.entry_price = Decimal(str(round(fill, 8)))
-            logger.info(f"Trade #{trade_id} OPEN @ ${fill:.4f}")
+            
+            # ── Validate API response structure ──────────────────────────────────
+            if not isinstance(res, dict):
+                raise RuntimeError(f"Invalid API response type: {type(res)}")
+            
+            order_id = res.get("id")
+            if not order_id:
+                raise RuntimeError("Order placed but no order ID in response")
+            
+            # ── Check order state and fill status ─────────────────────────────────
+            order_state = res.get("state", "").lower()
+            filled_qty = float(res.get("filled_quantity") or res.get("size", 0) or 0)
+            requested_qty = float(trade.quantity or 0)
+            
+            if filled_qty <= 0:
+                raise RuntimeError(f"Order not filled: state={order_state}, qty={filled_qty}")
+            
+            if filled_qty < requested_qty * 0.95:  # Allow 5% tolerance for rounding
+                logger.warning(f"Partial fill: requested={requested_qty:.6f} filled={filled_qty:.6f}")
+            
+            # ── Validate and extract fill price ──────────────────────────────────
+            fill = float(res.get("average_fill_price") or res.get("last_price") or 0)
+            if fill <= 0:
+                raise RuntimeError(f"Invalid fill price in response: {res.get('average_fill_price')} | {res.get('last_price')}")
+            
+            # ── Update trade with validated data ─────────────────────────────────
+            trade.exchange_order_id = str(order_id)
+            trade.entry_price = Decimal(str(round(fill, 8)))
+            trade.status = TradeStatus.OPEN
+            logger.info(f"Trade #{trade_id} OPEN @ ${fill:.4f} qty={filled_qty:.6f} state={order_state}")
+            
         except Exception as e:
             trade.status = TradeStatus.FAILED
             trade.notes  = str(e)[:500]
@@ -152,7 +188,18 @@ def close_trade_market(trade_id: int, exit_price: float, reason: str = "signal")
         try:
             cside  = "sell" if trade.direction == TradeDirection.BUY else "buy"
             res    = _place_order(str(trade.pair), cside, float(trade.quantity))
-            actual = float(res.get("average_fill_price") or res.get("limit_price") or exit_price)
+            
+            # Validate close order response
+            if not res.get("id"):
+                raise RuntimeError("Close order placed but no ID in response")
+            
+            filled_qty = float(res.get("filled_quantity") or res.get("size", 0) or 0)
+            if filled_qty <= 0:
+                raise RuntimeError(f"Close order not filled: state={res.get('state')}")
+            
+            actual = float(res.get("average_fill_price") or res.get("last_price") or 0)
+            if actual <= 0:
+                raise RuntimeError(f"Invalid close price in response: {res}")
             entry  = float(trade.entry_price or actual)
             pnl    = ((actual-entry) if trade.direction==TradeDirection.BUY else (entry-actual)) * float(trade.quantity)
             pnl_pct = ((actual-entry)/entry*100) if entry>0 else 0
