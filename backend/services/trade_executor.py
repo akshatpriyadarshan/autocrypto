@@ -1,164 +1,173 @@
 """
-Delta Exchange India executor.
-Uses ccxt.deltaindia — correct endpoint: api.india.delta.exchange
-Keys are hardcoded and configured for Streamlit Cloud IPs.
+Delta Exchange India — direct REST API, no ccxt.
+Endpoint: https://api.india.delta.exchange
+HMAC-SHA256 auth. Bypasses ccxt version issues entirely.
 """
+import hashlib, hmac, time, json
 from decimal import Decimal
 from datetime import datetime, timezone
 from typing import Optional
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
+import httpx
 
 from backend.db.database import get_session
 from backend.models.db_models import Trade, TradeStatus, TradeDirection
-from backend.config.config_manager import get_config
 from sqlalchemy import select
 
-# Live keys — configured for Streamlit Cloud IPs on Delta Exchange India
+BASE_URL         = "https://api.india.delta.exchange"
 DELTA_API_KEY    = "76wEBRrPbx64EUzphk43LIX1kCWrFb"
 DELTA_API_SECRET = "3lJghi3DLRdgeoesLYxfBg5l9jH4Q0HEjLMOkN744dp9dOH4ddiHG6Mv09cH"
 
-_exchange = None
+PAIR_TO_SYMBOL = {
+    "BTC/USDT":  "BTCUSDT",  "ETH/USDT":  "ETHUSDT",
+    "SOL/USDT":  "SOLUSDT",  "XRP/USDT":  "XRPUSDT",
+    "DOGE/USDT": "DOGEUSDT", "LINK/USDT": "LINKUSDT",
+    "AVAX/USDT": "AVAXUSDT", "ADA/USDT":  "ADAUSDT",
+}
+
+_product_cache: dict = {}
 
 
-def _get_exchange():
-    global _exchange
-    if _exchange:
-        return _exchange
-
-    import ccxt
-
-    # Use deltaindia — correct class for India endpoint
-    # api.india.delta.exchange, NOT api.delta.exchange (global)
-    if hasattr(ccxt, 'deltaindia'):
-        cls = ccxt.deltaindia
-        logger.info("Using ccxt.deltaindia (India endpoint)")
-    else:
-        # Fallback: use ccxt.delta with manual India URL override
-        cls = ccxt.delta
-        logger.warning("ccxt.deltaindia not found — using ccxt.delta with India URL override")
-
-    _exchange = cls({
-        "apiKey": DELTA_API_KEY,
-        "secret": DELTA_API_SECRET,
-        "enableRateLimit": True,
-    })
-
-    # If using base ccxt.delta, override URLs to India endpoint
-    if not hasattr(ccxt, 'deltaindia'):
-        _exchange.urls['api'] = {
-            'public':  'https://api.india.delta.exchange/v2',
-            'private': 'https://api.india.delta.exchange/v2',
-        }
-
-    logger.info(f"Delta Exchange India: LIVE mode")
-    return _exchange
+def _sign(method: str, path: str, body: str = "") -> dict:
+    ts  = str(int(time.time()))
+    sig = hmac.new(
+        DELTA_API_SECRET.encode(),
+        (method + ts + path + body).encode(),
+        hashlib.sha256
+    ).hexdigest()
+    return {"api-key": DELTA_API_KEY, "timestamp": ts, "signature": sig,
+            "Content-Type": "application/json", "User-Agent": "autocrypto/1.0"}
 
 
-def reset_exchange():
-    global _exchange
-    _exchange = None
+def _get(path: str) -> dict:
+    r = httpx.get(f"{BASE_URL}{path}", headers=_sign("GET", path), timeout=10.0)
+    r.raise_for_status()
+    return r.json()
+
+
+def _post(path: str, body: dict) -> dict:
+    s    = json.dumps(body, separators=(",", ":"))
+    r    = httpx.post(f"{BASE_URL}{path}", headers=_sign("POST", path, s), content=s, timeout=10.0)
+    data = r.json()
+    if not data.get("success"):
+        raise RuntimeError(f"Delta API: {data.get('error', data)}")
+    return data
 
 
 def get_wallet_balance_sync() -> Optional[float]:
-    """Returns USDT balance from Delta India. None if error."""
     try:
-        ex = _get_exchange()
-        bal = ex.fetch_balance()
-        # Delta India returns balances under asset symbols
-        for key in ["USDT", "usdt"]:
-            if key in bal:
-                val = bal[key].get("free") or bal[key].get("total") or 0
-                if val:
-                    return float(val)
-        # Some Delta responses nest under 'total'
-        total = bal.get("total", {})
-        if "USDT" in total:
-            return float(total["USDT"])
-        return 0.0
+        data = _get("/v2/wallet/balances")
+        if data.get("success"):
+            for a in data.get("result", []):
+                if a.get("asset_symbol") in ("USDT", "USD"):
+                    bal = float(a.get("balance") or a.get("available_balance") or 0)
+                    logger.info(f"Delta wallet: ${bal:.2f} USDT")
+                    return bal
+        logger.warning(f"Balance unexpected: {str(data)[:200]}")
+        return None
     except Exception as e:
-        logger.warning(f"Balance fetch: {e}")
+        logger.warning(f"Balance: {e}")
         return None
 
 
 def get_market_price_sync(pair: str) -> Optional[float]:
+    sym = PAIR_TO_SYMBOL.get(pair, pair.replace("/", ""))
     try:
-        ex = _get_exchange()
-        t = ex.fetch_ticker(pair)
-        return float(t.get("last") or t.get("bid") or 0) or None
+        data = _get(f"/v2/tickers/{sym}")
+        if data.get("success"):
+            r = data.get("result", {})
+            p = r.get("close") or r.get("mark_price") or r.get("last_price")
+            return float(p) if p else None
+        return None
     except Exception as e:
         logger.warning(f"Price {pair}: {e}")
         return None
 
 
+def _get_product_id(symbol: str) -> Optional[int]:
+    if symbol in _product_cache:
+        return _product_cache[symbol]
+    for ctype in ["spot", "perpetual_futures"]:
+        try:
+            data = _get(f"/v2/products?contract_type={ctype}&state=live")
+            if data.get("success"):
+                for p in data.get("result", []):
+                    if p.get("symbol") == symbol:
+                        pid = int(p["id"])
+                        _product_cache[symbol] = pid
+                        logger.info(f"{symbol} → product_id={pid} ({ctype})")
+                        return pid
+        except Exception as e:
+            logger.warning(f"Product lookup {ctype} {symbol}: {e}")
+    logger.error(f"No product_id for {symbol}")
+    return None
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10), reraise=True)
+def _place_order(pair: str, side: str, qty: float) -> dict:
+    sym  = PAIR_TO_SYMBOL.get(pair, pair.replace("/", ""))
+    pid  = _get_product_id(sym)
+    if not pid:
+        raise RuntimeError(f"Product not found: {sym}")
+    size = int(round(qty)) if qty >= 1 else qty
+    body = {"product_id": pid, "size": size, "side": side.lower(),
+            "order_type": "market_order", "time_in_force": "ioc"}
+    logger.info(f"Order: {side.upper()} {sym} size={size} pid={pid}")
+    data = _post("/v2/orders", body)
+    res  = data.get("result", {})
+    logger.info(f"Placed: id={res.get('id')} state={res.get('state')} avg={res.get('average_fill_price')}")
+    return res
+
+
 def execute_trade(trade_id: int):
     with get_session() as db:
-        trade = db.execute(
-            select(Trade).where(Trade.id == trade_id)
-        ).scalar_one_or_none()
+        trade = db.execute(select(Trade).where(Trade.id == trade_id)).scalar_one_or_none()
         if not trade or trade.status != TradeStatus.PENDING:
             return
         try:
-            order = _place_order(
-                str(trade.pair),
-                str(trade.direction.value),
-                float(trade.quantity)
-            )
-            fill = float(order.get("average") or order.get("price") or 0)
-            trade.exchange_order_id = str(order.get("id", ""))
-            trade.status = TradeStatus.OPEN
+            res  = _place_order(str(trade.pair), str(trade.direction.value), float(trade.quantity))
+            fill = float(res.get("average_fill_price") or res.get("limit_price") or 0)
+            trade.exchange_order_id = str(res.get("id", ""))
+            trade.status            = TradeStatus.OPEN
             if fill > 0:
                 trade.entry_price = Decimal(str(round(fill, 8)))
-            logger.info(f"Trade {trade_id} OPEN fill={fill}")
+            logger.info(f"Trade #{trade_id} OPEN @ ${fill:.4f}")
         except Exception as e:
             trade.status = TradeStatus.FAILED
-            trade.notes = f"FAILED: {e}"
-            logger.error(f"execute_trade {trade_id}: {e}")
-
+            trade.notes  = str(e)[:500]
+            logger.error(f"execute_trade #{trade_id}: {e}")
     try:
         from backend.services.fund_manager import take_fund_snapshot
         take_fund_snapshot()
     except Exception as e:
-        logger.error(f"Snapshot after open: {e}")
+        logger.error(f"Snapshot: {e}")
 
 
 def close_trade_market(trade_id: int, exit_price: float, reason: str = "signal"):
     with get_session() as db:
-        trade = db.execute(
-            select(Trade).where(Trade.id == trade_id)
-        ).scalar_one_or_none()
+        trade = db.execute(select(Trade).where(Trade.id == trade_id)).scalar_one_or_none()
         if not trade or trade.status != TradeStatus.OPEN:
             return
         try:
-            close_dir = "sell" if trade.direction == TradeDirection.BUY else "buy"
-            order  = _place_order(str(trade.pair), close_dir, float(trade.quantity))
-            actual = float(order.get("average") or order.get("price") or exit_price)
+            cside  = "sell" if trade.direction == TradeDirection.BUY else "buy"
+            res    = _place_order(str(trade.pair), cside, float(trade.quantity))
+            actual = float(res.get("average_fill_price") or res.get("limit_price") or exit_price)
             entry  = float(trade.entry_price or actual)
-            pnl    = (actual - entry) * float(trade.quantity) \
-                     if trade.direction == TradeDirection.BUY \
-                     else (entry - actual) * float(trade.quantity)
-            pnl_pct = ((actual - entry) / entry * 100) if entry > 0 else 0
-            if trade.direction == TradeDirection.SELL:
-                pnl_pct = -pnl_pct
+            pnl    = ((actual-entry) if trade.direction==TradeDirection.BUY else (entry-actual)) * float(trade.quantity)
+            pnl_pct = ((actual-entry)/entry*100) if entry>0 else 0
+            if trade.direction == TradeDirection.SELL: pnl_pct = -pnl_pct
             trade.status     = TradeStatus.CLOSED
             trade.exit_price = Decimal(str(round(actual, 8)))
             trade.pnl        = Decimal(str(round(pnl, 2)))
             trade.pnl_pct    = Decimal(str(round(pnl_pct, 4)))
             trade.closed_at  = datetime.now(timezone.utc)
             trade.notes      = (trade.notes or "") + f" | {reason}"
-            logger.info(f"Trade {trade_id} CLOSED pnl=₹{pnl:.2f}")
+            logger.info(f"Trade #{trade_id} CLOSED pnl=${pnl:.4f}")
         except Exception as e:
-            logger.error(f"close_trade {trade_id}: {e}")
-
+            logger.error(f"close_trade #{trade_id}: {e}")
     try:
         from backend.services.fund_manager import take_fund_snapshot
         take_fund_snapshot()
     except Exception as e:
-        logger.error(f"Snapshot after close: {e}")
-
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10), reraise=True)
-def _place_order(pair: str, side: str, qty: float) -> dict:
-    ex = _get_exchange()
-    logger.info(f"Order: {side.upper()} {pair} qty={qty}")
-    return ex.create_order(pair, "market", side, qty)
+        logger.error(f"Snapshot: {e}")
