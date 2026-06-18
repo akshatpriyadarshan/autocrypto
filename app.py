@@ -6,6 +6,8 @@ import os, sys, threading, time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from backend.services.signal_engine import USD_TO_INR
+
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
