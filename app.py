@@ -69,6 +69,10 @@ if "delta_seeded" not in st.session_state:
             # Ensure bot auto-starts after reboot by default (user can stop later)
             if get_config(db, "bot_active") is None:
                 set_config(db, "bot_active", "true")
+    st.session_state.delta_seeded = True
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def cfg(key):
     with get_session() as db:
         return get_config(db, key)
 
