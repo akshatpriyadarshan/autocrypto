@@ -3,7 +3,7 @@ Delta Exchange India — direct REST API, no ccxt.
 Endpoint: https://api.india.delta.exchange
 HMAC-SHA256 auth. Bypasses ccxt version issues entirely.
 """
-import hashlib, hmac, time, json
+import hashlib, hmac, os, time, json
 from decimal import Decimal
 from datetime import datetime, timezone
 from typing import Optional
@@ -11,6 +11,7 @@ from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
 import httpx
 
+from backend.config.config_manager import get_config
 from backend.db.database import get_session
 from backend.models.db_models import Trade, TradeStatus, TradeDirection
 from sqlalchemy import select
@@ -29,30 +30,55 @@ PAIR_TO_SYMBOL = {
 _product_cache: dict = {}
 
 
+def _get_delta_settings() -> tuple[str, str, bool]:
+    with get_session() as db:
+        api_key = os.getenv("DELTA_API_KEY") or get_config(db, "delta_api_key") or DELTA_API_KEY
+        api_secret = os.getenv("DELTA_API_SECRET") or get_config(db, "delta_api_secret") or DELTA_API_SECRET
+        if os.getenv("DELTA_TESTNET") is not None:
+            testnet = os.getenv("DELTA_TESTNET").lower() in ("1", "true", "yes", "y")
+        else:
+            testnet = get_config(db, "delta_testnet") == "true"
+    return api_key, api_secret, testnet
+
+
+def _delta_base_url(testnet: bool = False) -> str:
+    return "https://cdn-ind.testnet.deltaex.org" if testnet else BASE_URL
+
+
 def _sign(method: str, path: str, body: str = "") -> dict:
+    api_key, api_secret, _ = _get_delta_settings()
     ts  = str(int(time.time()))
     sig = hmac.new(
-        DELTA_API_SECRET.encode(),
+        api_secret.encode(),
         (method + ts + path + body).encode(),
         hashlib.sha256
     ).hexdigest()
-    return {"api-key": DELTA_API_KEY, "timestamp": ts, "signature": sig,
+    return {"api-key": api_key, "timestamp": ts, "signature": sig,
             "Content-Type": "application/json", "User-Agent": "autocrypto/1.0"}
 
 
 def _get(path: str) -> dict:
-    r = httpx.get(f"{BASE_URL}{path}", headers=_sign("GET", path), timeout=10.0)
-    r.raise_for_status()
+    _, _, testnet = _get_delta_settings()
+    r = httpx.get(f"{_delta_base_url(testnet)}{path}", headers=_sign("GET", path), timeout=10.0)
+    if r.status_code != 200:
+        try:
+            err = r.json()
+        except Exception:
+            err = r.text
+        raise RuntimeError(f"Delta API GET {path} failed {r.status_code}: {err}")
     return r.json()
 
 
 def _post(path: str, body: dict) -> dict:
     s    = json.dumps(body, separators=(",", ":"))
-    r    = httpx.post(f"{BASE_URL}{path}", headers=_sign("POST", path, s), content=s, timeout=10.0)
+    _, _, testnet = _get_delta_settings()
+    r    = httpx.post(f"{_delta_base_url(testnet)}{path}", headers=_sign("POST", path, s), content=s, timeout=10.0)
     try:
         data = r.json()
     except Exception as e:
         raise RuntimeError(f"Failed to parse API response: {e}")
+    if r.status_code != 200:
+        raise RuntimeError(f"Delta API POST {path} failed {r.status_code}: {data}")
     
     if not data.get("success"):
         error = data.get("error", data)
@@ -66,6 +92,9 @@ def _post(path: str, body: dict) -> dict:
 
 
 def get_wallet_balance_sync() -> Optional[float]:
+    api_key, _, _ = _get_delta_settings()
+    if api_key == DELTA_API_KEY:
+        logger.warning("Using built-in default Delta API key. This key is only whitelisted for Streamlit Cloud IPs and may fail locally.")
     try:
         data = _get("/v2/wallet/balances")
         if data.get("success"):
@@ -85,11 +114,11 @@ def get_market_price_sync(pair: str) -> Optional[float]:
     sym = PAIR_TO_SYMBOL.get(pair, pair.replace("/", ""))
     try:
         data = _get(f"/v2/tickers/{sym}")
-        if data.get("success"):
-            r = data.get("result", {})
-            p = r.get("close") or r.get("mark_price") or r.get("last_price")
-            return float(p) if p else None
-        return None
+        if not isinstance(data, dict) or not data.get("success"):
+            return None
+        r = data.get("result", {})
+        p = r.get("close") or r.get("mark_price") or r.get("last_price")
+        return float(p) if p else None
     except Exception as e:
         logger.warning(f"Price {pair}: {e}")
         return None

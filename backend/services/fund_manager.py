@@ -7,13 +7,29 @@ from datetime import datetime, timezone
 from loguru import logger
 from backend.db.database import get_session
 from backend.models.db_models import FundSnapshot, Trade, TradeStatus, Alert, AlertLevel
+import os
 from backend.config.config_manager import get_config
 from sqlalchemy import select, func
 
 # Delta India REST endpoint (direct — no ccxt needed for read-only balance)
-DELTA_INDIA_API = "https://api.india.delta.exchange/v2"
+DELTA_INDIAN_API = "https://api.india.delta.exchange/v2"
 DELTA_API_KEY    = "76wEBRrPbx64EUzphk43LIX1kCWrFb"
 DELTA_API_SECRET = "3lJghi3DLRdgeoesLYxfBg5l9jH4Q0HEjLMOkN744dp9dOH4ddiHG6Mv09cH"
+
+
+def _get_delta_auth() -> tuple[str, str, bool]:
+    with get_session() as db:
+        api_key = os.getenv("DELTA_API_KEY") or get_config(db, "delta_api_key") or DELTA_API_KEY
+        api_secret = os.getenv("DELTA_API_SECRET") or get_config(db, "delta_api_secret") or DELTA_API_SECRET
+        if os.getenv("DELTA_TESTNET") is not None:
+            testnet = os.getenv("DELTA_TESTNET").lower() in ("1", "true", "yes", "y")
+        else:
+            testnet = get_config(db, "delta_testnet") == "true"
+    return api_key, api_secret, testnet
+
+
+def _delta_api_url(testnet: bool = False) -> str:
+    return "https://cdn-ind.testnet.deltaex.org" if testnet else "https://api.india.delta.exchange"
 
 
 def take_fund_snapshot() -> dict:
@@ -108,21 +124,21 @@ def _get_balance() -> float | None:
         ts     = str(int(time.time()))
         method = "GET"
         path   = "/v2/wallet/balances"
-        sig_data = method + ts + path
+        api_key, api_secret, testnet = _get_delta_auth()
         sig = hmac.new(
-            DELTA_API_SECRET.encode(),
-            sig_data.encode(),
+            api_secret.encode(),
+            (method + ts + path).encode(),
             hashlib.sha256
         ).hexdigest()
         headers = {
-            "api-key":    DELTA_API_KEY,
+            "api-key":    api_key,
             "timestamp":  ts,
             "signature":  sig,
             "User-Agent": "autocrypto-trader/1.0",
             "Accept":     "application/json",
         }
         r = httpx.get(
-            f"{DELTA_INDIA_API}/wallet/balances",
+            f"{_delta_api_url(testnet)}{path}",
             headers=headers,
             timeout=10.0
         )

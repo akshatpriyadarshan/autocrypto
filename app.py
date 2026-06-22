@@ -62,20 +62,20 @@ DELTA_API_SECRET = "3lJghi3DLRdgeoesLYxfBg5l9jH4Q0HEjLMOkN744dp9dOH4ddiHG6Mv09cH
 if "delta_seeded" not in st.session_state:
     with get_session() as db:
         existing = get_config(db, "delta_api_key")
-        if not existing:
+        if not existing and not os.getenv("DELTA_API_KEY"):
             set_config(db, "delta_api_key",    DELTA_API_KEY,    is_secret=True)
             set_config(db, "delta_api_secret", DELTA_API_SECRET, is_secret=True)
             set_config(db, "delta_testnet",    "false")  # live keys — not testnet
-            # Ensure bot auto-starts after reboot by default (user can stop later)
-            if get_config(db, "bot_active") is None:
-                set_config(db, "bot_active", "true")
-            # Fetch starting capital from Delta wallet as fallback (store in INR)
-            try:
-                from backend.services.trade_executor import get_wallet_balance_sync
-                bal = get_wallet_balance_sync()
-                if bal and bal > 0:
-                    set_config(db, "starting_capital", str(int(bal * 85)))
-            except: pass  # Silent fallback — exchange may be unreachable
+        # Ensure bot auto-starts after reboot by default (user can stop later)
+        if get_config(db, "bot_active") is None:
+            set_config(db, "bot_active", "true")
+        # Fetch starting capital from Delta wallet as fallback (store in INR)
+        try:
+            from backend.services.trade_executor import get_wallet_balance_sync
+            bal = get_wallet_balance_sync()
+            if bal and bal > 0:
+                set_config(db, "starting_capital", str(int(bal * 85)))
+        except: pass  # Silent fallback — exchange may be unreachable
     st.session_state.delta_seeded = True
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -251,7 +251,8 @@ elif page == "⚙️ Setup":
     with st.form("setup"):
         st.markdown("#### 🔑 Delta Exchange")
         # Show pre-configured note
-        st.info("✅ Delta API credentials pre-configured for Streamlit Cloud IPs. Testnet/Live toggle below.")
+        env_note = "Use DELTA_API_KEY / DELTA_API_SECRET in env/.streamlit/secrets if you want local credentials."
+        st.info("✅ Delta API credentials pre-configured for Streamlit Cloud IPs. " + env_note)
         testnet = st.checkbox("Use Testnet (uncheck for Live trading)", value=ex("delta_testnet","false")=="true")
 
         st.markdown("#### 📬 Email Alerts")
@@ -310,9 +311,11 @@ elif page == "⚙️ Setup":
         if not errs:
             all_pairs = ",".join(spot_sel + fut_sel) or ",".join(RECOMMENDED_PAIRS)
             # Save each key individually — no bulk function, no complexity
+            delta_key = os.getenv("DELTA_API_KEY") or DELTA_API_KEY
+            delta_secret = os.getenv("DELTA_API_SECRET") or DELTA_API_SECRET
             keys = {
-                "delta_api_key":          DELTA_API_KEY,
-                "delta_api_secret":       DELTA_API_SECRET,
+                "delta_api_key":          delta_key,
+                "delta_api_secret":       delta_secret,
                 "delta_testnet":          str(testnet).lower(),
                 "tradingview_webhook_secret": "not-used",
                 "email_address":          email.strip(),
