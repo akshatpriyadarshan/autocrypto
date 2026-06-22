@@ -69,6 +69,13 @@ if "delta_seeded" not in st.session_state:
             # Ensure bot auto-starts after reboot by default (user can stop later)
             if get_config(db, "bot_active") is None:
                 set_config(db, "bot_active", "true")
+            # Fetch starting capital from Delta wallet as fallback (store in INR)
+            try:
+                from backend.services.trade_executor import get_wallet_balance_sync
+                bal = get_wallet_balance_sync()
+                if bal and bal > 0:
+                    set_config(db, "starting_capital", str(int(bal * 85)))
+            except: pass  # Silent fallback — exchange may be unreachable
     st.session_state.delta_seeded = True
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -326,6 +333,9 @@ elif page == "⚙️ Setup":
                 "setup_complete":         "true",
                 "bot_active":             current_bot,
             }
+            # ponytail: Save fetched balance as fallback starting capital (in INR)
+            if _bal is not None and _bal > 0:
+                keys["starting_capital"] = str(int(_bal * 85))  # USD → INR
             try:
                 with get_session() as db:
                     for k, v in keys.items():
