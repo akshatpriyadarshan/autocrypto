@@ -69,6 +69,13 @@ if "delta_seeded" not in st.session_state:
         # Ensure bot auto-starts after reboot by default (user can stop later)
         if get_config(db, "bot_active") is None:
             set_config(db, "bot_active", "true")
+        # Seed setup_complete if missing (user can re-run setup to customize)
+        if get_config(db, "setup_complete") is None:
+            set_config(db, "setup_complete", "true")
+        # Seed trading pairs if missing (prevents empty signal engine)
+        if not get_config(db, "trading_pairs"):
+            from backend.services.signal_engine import RECOMMENDED_PAIRS
+            set_config(db, "trading_pairs", ",".join(RECOMMENDED_PAIRS))
         # Fetch starting capital from Delta wallet as fallback (store in INR)
         try:
             from backend.services.trade_executor import get_wallet_balance_sync
